@@ -1,10 +1,12 @@
 package org.wordpress.android.fluxc.store.dashboard
 
+import kotlinx.coroutines.flow.map
 import org.wordpress.android.fluxc.Payload
 import org.wordpress.android.fluxc.model.SiteModel
-import org.wordpress.android.fluxc.model.dashboard.CardsModel
+import org.wordpress.android.fluxc.model.dashboard.CardModel
 import org.wordpress.android.fluxc.network.rest.wpcom.dashboard.CardsRestClient
 import org.wordpress.android.fluxc.network.rest.wpcom.dashboard.CardsRestClient.CardsResponse
+import org.wordpress.android.fluxc.persistence.dashboard.CardsDao
 import org.wordpress.android.fluxc.store.Store
 import org.wordpress.android.fluxc.store.Store.OnChangedError
 import org.wordpress.android.fluxc.tools.CoroutineEngine
@@ -15,39 +17,56 @@ import javax.inject.Singleton
 @Singleton
 class CardsStore @Inject constructor(
     private val restClient: CardsRestClient,
+    private val cardsDao: CardsDao,
     private val coroutineEngine: CoroutineEngine
 ) {
-    @Suppress("unused")
     suspend fun fetchCards(
-        site: SiteModel
+        site: SiteModel,
+        cardTypes: List<CardModel.Type>
     ) = coroutineEngine.withDefaultContext(AppLog.T.API, this, "fetchCards") {
-        val payload = restClient.fetchCards(site)
-        return@withDefaultContext storeCards(payload)
+        val payload = restClient.fetchCards(site, cardTypes)
+        return@withDefaultContext storeCards(site, payload)
     }
 
-    private fun storeCards(
-        payload: FetchedCardsPayload<CardsResponse>
-    ): OnCardsFetched<CardsModel> {
-        return when {
-            payload.isError -> OnCardsFetched(payload.error)
-            payload.response != null -> {
-                // TODO: Store in db.
-                OnCardsFetched(payload.response.toCards())
-            }
-            else -> OnCardsFetched(CardsError(CardsErrorType.INVALID_RESPONSE))
+    private suspend fun storeCards(
+        site: SiteModel,
+        payload: CardsPayload<CardsResponse>
+    ): CardsResult<List<CardModel>> = when {
+        payload.isError -> handlePayloadError(payload.error)
+        payload.response != null -> handlePayloadResponse(site, payload.response)
+        else -> CardsResult(CardsError(CardsErrorType.INVALID_RESPONSE))
+    }
+
+    private fun handlePayloadError(
+        error: CardsError
+    ): CardsResult<List<CardModel>> = when (error.type) {
+        CardsErrorType.AUTHORIZATION_REQUIRED -> {
+            cardsDao.clear()
+            CardsResult()
         }
+        else -> CardsResult(error)
     }
 
-    @Suppress("unused", "UNUSED_PARAMETER")
+    private suspend fun handlePayloadResponse(
+        site: SiteModel,
+        response: CardsResponse
+    ): CardsResult<List<CardModel>> = try {
+        cardsDao.insertWithDate(site.id, response.toCards())
+        CardsResult()
+    } catch (e: Exception) {
+        CardsResult(CardsError(CardsErrorType.GENERIC_ERROR))
+    }
+
     fun getCards(
-        site: SiteModel
-    ) = coroutineEngine.run(AppLog.T.DB, this, "getCards") {
-        // TODO: Get from db.
+        site: SiteModel,
+        cardTypes: List<CardModel.Type>
+    ) = cardsDao.get(site.id, cardTypes).map { cards ->
+        CardsResult(cards.map { it.toCard() })
     }
 
     /* PAYLOADS */
 
-    data class FetchedCardsPayload<T>(
+    data class CardsPayload<T>(
         val response: T? = null
     ) : Payload<CardsError>() {
         constructor(error: CardsError) : this() {
@@ -57,7 +76,7 @@ class CardsStore @Inject constructor(
 
     /* ACTIONS */
 
-    data class OnCardsFetched<T>(
+    data class CardsResult<T>(
         val model: T? = null,
         val cached: Boolean = false
     ) : Store.OnChanged<CardsError>() {
@@ -68,6 +87,28 @@ class CardsStore @Inject constructor(
 
     /* ERRORS */
 
+    enum class TodaysStatsCardErrorType {
+        JETPACK_DISCONNECTED,
+        JETPACK_DISABLED,
+        UNAUTHORIZED,
+        GENERIC_ERROR
+    }
+
+    class TodaysStatsCardError(
+        val type: TodaysStatsCardErrorType,
+        val message: String? = null
+    ) : OnChangedError
+
+    enum class PostCardErrorType {
+        UNAUTHORIZED,
+        GENERIC_ERROR
+    }
+
+    class PostCardError(
+        val type: PostCardErrorType,
+        val message: String? = null
+    ) : OnChangedError
+
     enum class CardsErrorType {
         GENERIC_ERROR,
         AUTHORIZATION_REQUIRED,
@@ -76,5 +117,8 @@ class CardsStore @Inject constructor(
         TIMEOUT
     }
 
-    class CardsError(var type: CardsErrorType, var message: String? = null) : OnChangedError
+    class CardsError(
+        val type: CardsErrorType,
+        val message: String? = null
+    ) : OnChangedError
 }

@@ -2,7 +2,6 @@ package org.wordpress.android.fluxc.store
 
 import android.content.Context
 import com.wellsql.generated.SiteModelTable
-import kotlinx.coroutines.flow.Flow
 import org.greenrobot.eventbus.Subscribe
 import org.greenrobot.eventbus.ThreadMode
 import org.wordpress.android.fluxc.Dispatcher
@@ -17,18 +16,18 @@ import org.wordpress.android.fluxc.model.WCSettingsModel.CurrencyPosition.LEFT
 import org.wordpress.android.fluxc.model.WCSettingsModel.CurrencyPosition.LEFT_SPACE
 import org.wordpress.android.fluxc.model.WCSettingsModel.CurrencyPosition.RIGHT
 import org.wordpress.android.fluxc.model.WCSettingsModel.CurrencyPosition.RIGHT_SPACE
+import org.wordpress.android.fluxc.model.plugin.SitePluginModel
 import org.wordpress.android.fluxc.network.BaseRequest.GenericErrorType.UNKNOWN
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.WooCommerceRestClient
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.WooError
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.WooErrorType.GENERIC_ERROR
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.WooResult
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.system.WooSystemRestClient
+import org.wordpress.android.fluxc.network.rest.wpcom.wc.system.toDomainModel
+import org.wordpress.android.fluxc.persistence.PluginSqlUtils
 import org.wordpress.android.fluxc.persistence.SiteSqlUtils
-import org.wordpress.android.fluxc.persistence.WCPluginSqlUtils
-import org.wordpress.android.fluxc.persistence.WCPluginSqlUtils.WCPluginModel
 import org.wordpress.android.fluxc.persistence.WCProductSettingsSqlUtils
 import org.wordpress.android.fluxc.persistence.WCSettingsSqlUtils
-import org.wordpress.android.fluxc.persistence.dao.SSRDao
 import org.wordpress.android.fluxc.store.SiteStore.FetchSitesPayload
 import org.wordpress.android.fluxc.store.SiteStore.OnSiteChanged
 import org.wordpress.android.fluxc.tools.CoroutineEngine
@@ -49,12 +48,13 @@ open class WooCommerceStore @Inject constructor(
     private val siteStore: SiteStore,
     private val systemRestClient: WooSystemRestClient,
     private val wcCoreRestClient: WooCommerceRestClient,
-    private val siteSqlUtils: SiteSqlUtils,
-    private val ssrDao: SSRDao
+    private val siteSqlUtils: SiteSqlUtils
 ) : Store(dispatcher) {
-    enum class WooPlugin(val displayName: String) {
-        WOO_SERVICES("WooCommerce Shipping &amp; Tax"),
-        WOO_PAYMENTS("WooCommerce Payments");
+    enum class WooPlugin(val pluginName: String) {
+        WOO_CORE("woocommerce/woocommerce"),
+        WOO_SERVICES("woocommerce-services/woocommerce-services"),
+        WOO_PAYMENTS("woocommerce-payments/woocommerce-payments"),
+        WOO_STRIPE_GATEWAY("woocommerce-gateway-stripe/woocommerce-gateway-stripe"),
     }
     companion object {
         const val WOO_API_NAMESPACE_V1 = "wc/v1"
@@ -230,17 +230,17 @@ open class WooCommerceStore @Inject constructor(
         return siteSettings?.countryCode
     }
 
-    fun getSitePlugin(site: SiteModel, plugin: WooPlugin): WCPluginModel? {
-        return WCPluginSqlUtils.selectSingle(site, plugin.displayName)
+    fun getSitePlugin(site: SiteModel, plugin: WooPlugin): SitePluginModel? {
+        return PluginSqlUtils.getSitePluginByName(site, plugin.pluginName)
     }
 
-    suspend fun getSitePlugins(site: SiteModel): List<WCPluginModel> {
+    suspend fun getSitePlugins(site: SiteModel): List<SitePluginModel> {
         return coroutineEngine.withDefaultContext(T.DB, this, "getSitePlugins") {
-            WCPluginSqlUtils.selectAll(site)
+            PluginSqlUtils.getSitePlugins(site)
         }
     }
 
-    suspend fun fetchSitePlugins(site: SiteModel): WooResult<List<WCPluginModel>> {
+    suspend fun fetchSitePlugins(site: SiteModel): WooResult<List<SitePluginModel>> {
         return coroutineEngine.withDefaultContext(T.API, this, "fetchWooCommerceServicesPluginInfo") {
             val response = systemRestClient.fetchInstalledPlugins(site)
             return@withDefaultContext when {
@@ -248,8 +248,8 @@ open class WooCommerceStore @Inject constructor(
                     WooResult(response.error)
                 }
                 response.result?.plugins != null -> {
-                    val plugins = response.result.plugins.map { WCPluginModel(site, it) }
-                    WCPluginSqlUtils.insertOrUpdate(plugins)
+                    val plugins = response.result.plugins.map { it.toDomainModel(site.id) }
+                    PluginSqlUtils.insertOrReplaceSitePlugins(site, plugins)
                     WooResult(plugins)
                 }
                 else -> WooResult(WooError(GENERIC_ERROR, UNKNOWN))
@@ -275,16 +275,11 @@ open class WooCommerceStore @Inject constructor(
                             security = response.result.security?.toString(),
                             pages = response.result.pages?.toString()
                     )
-                    ssrDao.insertSSR(ssr.mapToEntity())
                     WooResult(ssr)
                 }
                 else -> WooResult(WooError(GENERIC_ERROR, UNKNOWN))
             }
         }
-    }
-
-    fun observeSSRForSite(remoteSiteId: Long): Flow<WCSSRModel> {
-        return ssrDao.observeSSRForSite(remoteSiteId)
     }
 
     private suspend fun fetchUpdatedSiteMetaData(site: SiteModel): WooResult<Boolean> {

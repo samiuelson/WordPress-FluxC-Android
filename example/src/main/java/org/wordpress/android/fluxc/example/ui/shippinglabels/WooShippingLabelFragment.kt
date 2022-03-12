@@ -28,10 +28,8 @@ import org.wordpress.android.fluxc.example.ui.StoreSelectingFragment
 import org.wordpress.android.fluxc.example.utils.showSingleLineDialog
 import org.wordpress.android.fluxc.generated.WCCoreActionBuilder
 import org.wordpress.android.fluxc.generated.WCOrderActionBuilder
-import org.wordpress.android.fluxc.model.LocalOrRemoteId.RemoteId
 import org.wordpress.android.fluxc.model.SiteModel
-import org.wordpress.android.fluxc.model.WCOrderModel
-import org.wordpress.android.fluxc.model.order.OrderIdentifier
+import org.wordpress.android.fluxc.model.OrderEntity
 import org.wordpress.android.fluxc.model.shippinglabels.WCContentType
 import org.wordpress.android.fluxc.model.shippinglabels.WCCustomsItem
 import org.wordpress.android.fluxc.model.shippinglabels.WCNonDeliveryOption
@@ -476,7 +474,7 @@ class WooShippingLabelFragment : StoreSelectingFragment() {
                                             coroutineScope.launch {
                                                 val result = wcShippingLabelStore.getShippingRates(
                                                         site,
-                                                        order.remoteOrderId,
+                                                        order.orderId,
                                                         origin,
                                                         destination,
                                                         listOf(box),
@@ -581,7 +579,7 @@ class WooShippingLabelFragment : StoreSelectingFragment() {
 
                     val ratesResult = wcShippingLabelStore.getShippingRates(
                             site,
-                            order.remoteOrderId,
+                            order.orderId,
                             if (isInternational) origin.copy(phone = "0000000000") else origin,
                             if (isInternational) destination.copy(phone = "0000000000") else destination,
                             listOf(box),
@@ -619,7 +617,7 @@ class WooShippingLabelFragment : StoreSelectingFragment() {
                     prependToLog("Purchasing label")
                     val result = wcShippingLabelStore.purchaseShippingLabels(
                             site,
-                            order.remoteOrderId,
+                            order.orderId,
                             if (isInternational) origin.copy(phone = "0000000000") else origin,
                             if (isInternational) destination.copy(phone = "0000000000") else destination,
                             listOf(packageData),
@@ -655,7 +653,7 @@ class WooShippingLabelFragment : StoreSelectingFragment() {
                     }
                     val plugin = wooCommerceStore.getSitePlugin(site, WOO_SERVICES)
                     plugin?.let {
-                        prependToLog("$it")
+                        prependToLog("${it.displayName} ${it.version}")
                     }
                 }
             }
@@ -735,12 +733,12 @@ class WooShippingLabelFragment : StoreSelectingFragment() {
     }
 
     private suspend fun loadData(site: SiteModel, orderId: Long):
-            Triple<WCOrderModel?, ShippingLabelAddress?, ShippingLabelAddress?> {
+            Triple<OrderEntity?, ShippingLabelAddress?, ShippingLabelAddress?> {
         prependToLog("Loading shipping data...")
 
         dispatcher.dispatch(WCCoreActionBuilder.newFetchSiteSettingsAction(site))
 
-        val payload = FetchOrdersByIdsPayload(site, listOf(RemoteId(orderId)))
+        val payload = FetchOrdersByIdsPayload(site, listOf(orderId))
         dispatcher.dispatch(WCOrderActionBuilder.newFetchOrdersByIdsAction(payload))
 
         delay(5000)
@@ -756,7 +754,7 @@ class WooShippingLabelFragment : StoreSelectingFragment() {
             )
         }
 
-        val order = wcOrderStore.getOrderByIdentifier(OrderIdentifier(site.id, orderId))
+        val order = wcOrderStore.getOrderByIdAndSite(orderId, site)
         val destination = order?.getShippingAddress()?.let {
             ShippingLabelAddress(
                     name = "${it.firstName} ${it.lastName}",

@@ -1,6 +1,8 @@
+@file:Suppress("DEPRECATION_ERROR")
 package org.wordpress.android.fluxc.wc.order
 
 import android.app.Application
+import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.nhaarman.mockitokotlin2.any
 import com.nhaarman.mockitokotlin2.check
@@ -25,18 +27,18 @@ import org.wordpress.android.fluxc.UnitTestUtils
 import org.wordpress.android.fluxc.generated.WCOrderActionBuilder
 import org.wordpress.android.fluxc.generated.WCOrderActionBuilder.newFetchedOrderListAction
 import org.wordpress.android.fluxc.model.LocalOrRemoteId.LocalId
-import org.wordpress.android.fluxc.model.LocalOrRemoteId.RemoteId
 import org.wordpress.android.fluxc.model.SiteModel
 import org.wordpress.android.fluxc.model.WCOrderListDescriptor
-import org.wordpress.android.fluxc.model.WCOrderModel
-import org.wordpress.android.fluxc.model.WCOrderNoteModel
+import org.wordpress.android.fluxc.model.OrderEntity
 import org.wordpress.android.fluxc.model.WCOrderStatusModel
 import org.wordpress.android.fluxc.model.WCOrderSummaryModel
-import org.wordpress.android.fluxc.model.order.OrderIdentifier
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.order.CoreOrderStatus
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.order.OrderRestClient
 import org.wordpress.android.fluxc.persistence.OrderSqlUtils
+import org.wordpress.android.fluxc.persistence.WCAndroidDatabase
 import org.wordpress.android.fluxc.persistence.WellSqlConfig
+import org.wordpress.android.fluxc.persistence.dao.OrderNotesDao
+import org.wordpress.android.fluxc.persistence.dao.OrdersDao
 import org.wordpress.android.fluxc.store.WCOrderFetcher
 import org.wordpress.android.fluxc.store.WCOrderStore
 import org.wordpress.android.fluxc.store.WCOrderStore.FetchOrderListResponsePayload
@@ -56,14 +58,33 @@ import kotlin.test.assertTrue
 class WCOrderStoreTest {
     private val orderFetcher: WCOrderFetcher = mock()
     private val orderRestClient: OrderRestClient = mock()
-    private val orderStore = WCOrderStore(Dispatcher(), orderRestClient, orderFetcher, initCoroutineEngine())
+    lateinit var ordersDao: OrdersDao
+    lateinit var orderNotesDao: OrderNotesDao
+    lateinit var orderStore: WCOrderStore
 
     @Before
     fun setUp() {
         val appContext = ApplicationProvider.getApplicationContext<Application>()
+
+        val database = Room.inMemoryDatabaseBuilder(appContext, WCAndroidDatabase::class.java)
+                .allowMainThreadQueries()
+                .build()
+
+        ordersDao = database.ordersDao
+        orderNotesDao = database.orderNotesDao
+
+        orderStore = WCOrderStore(
+                dispatcher = Dispatcher(),
+                wcOrderRestClient = orderRestClient,
+                wcOrderFetcher = orderFetcher,
+                coroutineEngine = initCoroutineEngine(),
+                ordersDao = ordersDao,
+                orderNotesDao = orderNotesDao
+        )
+
         val config = SingleStoreWellSqlConfigForTests(
                 appContext,
-                listOf(WCOrderModel::class.java, WCOrderNoteModel::class.java, WCOrderStatusModel::class.java),
+                listOf(WCOrderStatusModel::class.java),
                 WellSqlConfig.ADDON_WOOCOMMERCE
         )
         WellSql.init(config)
@@ -72,90 +93,100 @@ class WCOrderStoreTest {
 
     @Test
     fun testSimpleInsertionAndRetrieval() {
-        val orderModel = OrderTestUtils.generateSampleOrder(42)
-        val site = SiteModel().apply { id = orderModel.localSiteId }
+        runBlocking {
+            val orderModel = OrderTestUtils.generateSampleOrder(42)
+            ordersDao.insertOrUpdateOrder(orderModel)
+            val site = SiteModel().apply { id = orderModel.localSiteId.value }
 
-        OrderSqlUtils.insertOrUpdateOrder(orderModel)
-
-        val storedOrders = OrderSqlUtils.getOrdersForSite(site)
-        assertEquals(1, storedOrders.size)
-        assertEquals(42, storedOrders[0].remoteOrderId)
-        assertEquals(orderModel, storedOrders[0])
+            val storedOrders = ordersDao.getOrdersForSite(site.localId())
+            assertEquals(1, storedOrders.size)
+            assertEquals(42, storedOrders[0].orderId)
+            assertEquals(orderModel, storedOrders[0])
+        }
     }
 
     @Test
     fun testGetOrders() {
-        val processingOrder = OrderTestUtils.generateSampleOrder(3)
-        val onHoldOrder = OrderTestUtils.generateSampleOrder(4, CoreOrderStatus.ON_HOLD.value)
-        val cancelledOrder = OrderTestUtils.generateSampleOrder(5, CoreOrderStatus.CANCELLED.value)
-        OrderSqlUtils.insertOrUpdateOrder(processingOrder)
-        OrderSqlUtils.insertOrUpdateOrder(onHoldOrder)
-        OrderSqlUtils.insertOrUpdateOrder(cancelledOrder)
+        runBlocking {
+            val processingOrder = OrderTestUtils.generateSampleOrder(3).saveToDb()
+            OrderTestUtils.generateSampleOrder(4, CoreOrderStatus.ON_HOLD.value).saveToDb()
+            val cancelledOrder = OrderTestUtils.generateSampleOrder(5, CoreOrderStatus.CANCELLED.value).saveToDb()
 
-        val site = SiteModel().apply { id = processingOrder.localSiteId }
+            val site = SiteModel().apply { id = processingOrder.localSiteId.value }
 
-        val orderList = orderStore
+            val orderList = orderStore
                 .getOrdersForSite(site, CoreOrderStatus.PROCESSING.value, CoreOrderStatus.CANCELLED.value)
 
-        assertEquals(2, orderList.size)
-        assertTrue(orderList.contains(processingOrder))
-        assertTrue(orderList.contains(cancelledOrder))
+            assertEquals(2, orderList.size)
+            assertTrue(orderList.contains(processingOrder))
+            assertTrue(orderList.contains(cancelledOrder))
 
-        val fullOrderList = orderStore.getOrdersForSite(site)
-        assertEquals(3, fullOrderList.size)
+            val fullOrderList = orderStore.getOrdersForSite(site)
+            assertEquals(3, fullOrderList.size)
+        }
+    }
+
+    private fun OrderEntity.saveToDb(): OrderEntity {
+        ordersDao.insertOrUpdateOrder(this)
+        return copy()
     }
 
     @Test
     fun testGetOrderByLocalId() {
-        val sampleOrder = OrderTestUtils.generateSampleOrder(3)
-        OrderSqlUtils.insertOrUpdateOrder(sampleOrder)
+        runBlocking {
+            val sampleOrder = OrderTestUtils.generateSampleOrder(3)
+            ordersDao.insertOrUpdateOrder(sampleOrder)
 
-        val retrievedOrder = orderStore.getOrderByIdentifier(sampleOrder.getIdentifier())
-        assertEquals(sampleOrder, retrievedOrder)
+            val site = SiteModel().apply { this.id = sampleOrder.localSiteId.value }
 
-        // Non-existent ID should return null
-        assertNull(orderStore.getOrderByIdentifier(OrderIdentifier(WCOrderModel(id = 1955))))
+            val retrievedOrder = orderStore.getOrderByIdAndSite(sampleOrder.orderId, site)
+            assertEquals(sampleOrder, retrievedOrder)
+
+            // Non-existent ID should return null
+            // assertNull(orderStore.getOrderByIdentifier(OrderIdentifier(WCOrderModel(id = 1955))))
+        }
     }
 
     @Test
     fun testCustomOrderStatus() {
-        val customStatus = "chronologically-incongruous"
-        val customStatusOrder = OrderTestUtils.generateSampleOrder(3, customStatus)
-        OrderSqlUtils.insertOrUpdateOrder(customStatusOrder)
+        runBlocking {
+            val customStatus = "chronologically-incongruous"
+            val customStatusOrder = OrderTestUtils.generateSampleOrder(3, customStatus)
+            ordersDao.insertOrUpdateOrder(customStatusOrder)
 
-        val site = SiteModel().apply { id = customStatusOrder.localSiteId }
+            val site = SiteModel().apply { id = customStatusOrder.localSiteId.value }
 
-        val orderList = orderStore.getOrdersForSite(site, customStatus)
-        assertEquals(1, orderList.size)
-        assertTrue(orderList.contains(customStatusOrder))
+            val orderList = orderStore.getOrdersForSite(site, customStatus)
+            assertEquals(1, orderList.size)
+            assertTrue(orderList.contains(customStatusOrder))
 
-        val orderList2 = orderStore.getOrdersForSite(site, customStatus, CoreOrderStatus.CANCELLED.value)
-        assertEquals(1, orderList2.size)
-        assertTrue(orderList2.contains(customStatusOrder))
+            val orderList2 = orderStore.getOrdersForSite(site, customStatus, CoreOrderStatus.CANCELLED.value)
+            assertEquals(1, orderList2.size)
+            assertTrue(orderList2.contains(customStatusOrder))
 
-        val fullOrderList = orderStore.getOrdersForSite(site)
-        assertEquals(1, fullOrderList.size)
+            val fullOrderList = orderStore.getOrdersForSite(site)
+            assertEquals(1, fullOrderList.size)
+        }
     }
 
     @Test
     fun testUpdateOrderStatus() = runBlocking {
         val orderModel = OrderTestUtils.generateSampleOrder(42)
-        val site = SiteModel().apply { id = orderModel.localSiteId }
-        OrderSqlUtils.insertOrUpdateOrder(orderModel)
-        val result = RemoteOrderPayload(orderModel.apply { status = CoreOrderStatus.REFUNDED.value }, site)
+        ordersDao.insertOrUpdateOrder(orderModel)
+        val site = SiteModel().apply { id = orderModel.localSiteId.value }
+        val result = RemoteOrderPayload(orderModel.copy(status = CoreOrderStatus.REFUNDED.value), site)
         whenever(orderRestClient.updateOrderStatus(orderModel, site, CoreOrderStatus.REFUNDED.value))
-            .thenReturn(result)
+                .thenReturn(result)
 
-        orderStore.updateOrderStatus(LocalId(orderModel.id), site, CoreOrderStatus.REFUNDED.value)
+        orderStore.updateOrderStatus(orderModel.orderId, site, WCOrderStatusModel(CoreOrderStatus.REFUNDED.value))
             .toList()
 
-        with(orderStore.getOrderByIdentifier(orderModel.getIdentifier())!!) {
+        with(orderStore.getOrderByIdAndSite(orderModel.orderId, site)!!) {
             // The version of the order model in the database should have the updated status
             assertEquals(CoreOrderStatus.REFUNDED.value, status)
             // Other fields should not be altered by the update
             assertEquals(orderModel.currency, currency)
         }
-        Unit
     }
 
     @Test
@@ -194,129 +225,130 @@ class WCOrderStoreTest {
     }
 
     @Test
-    fun testGetOrderNotesForOrder() {
+    fun testGetOrderNotesForOrder() = runBlocking {
         val notesJson = UnitTestUtils.getStringFromResourceFile(this.javaClass, "wc/order_notes.json")
-        val noteModels = OrderTestUtils.getOrderNotesFromJsonString(notesJson, 6, 949)
-        val orderModel = OrderTestUtils.generateSampleOrder(1).apply { id = 949 }
+        val orderId = 949L
+        val siteId = 6L
+        val noteModels = OrderTestUtils.getOrderNotesFromJsonString(notesJson, siteId, orderId)
+        val orderModel = OrderTestUtils.generateSampleOrder(orderId).copy(localSiteId = LocalId(siteId.toInt()))
+        val site = SiteModel().apply { setSiteId(siteId) }
         assertEquals(6, noteModels.size)
-        OrderSqlUtils.insertOrIgnoreOrderNote(noteModels[0])
+        orderNotesDao.insertNotes(noteModels[0])
 
-        val retrievedNotes = orderStore.getOrderNotesForOrder(orderModel.id)
+        val retrievedNotes = orderStore.getOrderNotesForOrder(site, orderModel.orderId)
         assertEquals(1, retrievedNotes.size)
         assertEquals(noteModels[0], retrievedNotes[0])
     }
 
     @Test
     fun testOrderToIdentifierToOrder() {
-        // Convert an order to identifier and restore it from the database
-        OrderTestUtils.generateSampleOrder(3).let { sampleOrder ->
-            OrderSqlUtils.insertOrUpdateOrder(sampleOrder)
+        runBlocking {
+            val site = SiteModel().apply { id = 6 }
+            // Convert an order to identifier and restore it from the database
+            OrderTestUtils.generateSampleOrder(3).saveToDb().let { sampleOrder ->
+                assertEquals(sampleOrder, orderStore.getOrderByIdAndSite(3, site))
+            }
 
-            val packagedOrder = sampleOrder.getIdentifier()
-            assertEquals("1-3-6", packagedOrder)
+            // Attempt to restore an order that doesn't exist in the database
+            OrderTestUtils.generateSampleOrder(4).let {
+                assertNull(orderStore.getOrderByIdAndSite(4, site))
+            }
 
-            assertEquals(sampleOrder, orderStore.getOrderByIdentifier(packagedOrder))
-        }
+            // Restore an order that doesn't have a remote ID
+            OrderTestUtils.generateSampleOrder(0).saveToDb().let { draftOrder ->
+                assertEquals(draftOrder, orderStore.getOrderByIdAndSite(0, site))
+            }
 
-        // Attempt to restore an order that doesn't exist in the database
-        OrderTestUtils.generateSampleOrder(4).let { unpersistedOrder ->
-            val packagedOrder = unpersistedOrder.getIdentifier()
-            assertEquals("0-4-6", packagedOrder)
-
-            assertNull(orderStore.getOrderByIdentifier(packagedOrder))
-        }
-
-        // Restore an order that doesn't have a remote ID
-        OrderTestUtils.generateSampleOrder(0).let { draftOrder ->
-            OrderSqlUtils.insertOrUpdateOrder(draftOrder)
-
-            val packagedOrder = draftOrder.getIdentifier()
-            assertEquals("2-0-6", packagedOrder)
-
-            assertEquals(draftOrder, orderStore.getOrderByIdentifier(packagedOrder))
-        }
-
-        // Restore an order without a local ID by matching site and remote order IDs
-        OrderTestUtils.generateSampleOrder(3).let { duplicateRemoteOrder ->
-            val packagedOrder = duplicateRemoteOrder.getIdentifier()
-            assertEquals("0-3-6", packagedOrder)
-
-            assertEquals(duplicateRemoteOrder.apply { id = 1 }, orderStore.getOrderByIdentifier(packagedOrder))
+            // Restore an order without a local ID by matching site and remote order IDs
+            OrderTestUtils.generateSampleOrder(3).let { duplicateRemoteOrder ->
+                assertEquals(duplicateRemoteOrder, orderStore.getOrderByIdAndSite(3, site))
+            }
         }
     }
 
     @Test
     fun testFetchingOnlyOutdatedOrMissingOrders() {
-        val site = SiteModel().apply { id = 8 }
+        runBlocking {
+            val site = SiteModel().apply { id = 8 }
 
-        val upToDate = setupUpToDateOrders(site)
-        upToDate.orders.filterNotNull().forEach(OrderSqlUtils::insertOrUpdateOrder)
-        assertThat(OrderSqlUtils.getOrdersForSite(site)).hasSize(10)
+            val upToDate = setupUpToDateOrders(site)
+            upToDate.orders.filterNotNull().forEach(ordersDao::insertOrUpdateOrder)
+            assertThat(ordersDao.getOrdersForSite(site.localId())).hasSize(10)
 
-        val outdated = setupOutdatedOrders(site)
-        outdated.orders.filterNotNull().forEach(OrderSqlUtils::insertOrUpdateOrder)
-        assertThat(OrderSqlUtils.getOrdersForSite(site)).hasSize(20)
+            val outdated = setupOutdatedOrders(site)
+            outdated.orders.filterNotNull().forEach(ordersDao::insertOrUpdateOrder)
+            assertThat(ordersDao.getOrdersForSite(site.localId())).hasSize(20)
 
-        val missing = setupMissingOrders()
-        assertThat(OrderSqlUtils.getOrdersForSite(site)).hasSize(20)
+            val missing = setupMissingOrders()
+            assertThat(ordersDao.getOrdersForSite(site.localId())).hasSize(20)
 
-        orderStore.onAction(
+            orderStore.onAction(
                 newFetchedOrderListAction(
-                        FetchOrderListResponsePayload(
-                                WCOrderListDescriptor(site = site),
-                                requestStartTime = Calendar.getInstance(),
-                                orderSummaries = upToDate.summaries + outdated.summaries + missing.summaries
-                        )
+                    FetchOrderListResponsePayload(
+                        WCOrderListDescriptor(site = site),
+                        requestStartTime = Calendar.getInstance(),
+                        orderSummaries = upToDate.summaries + outdated.summaries + missing.summaries
+                    )
                 )
-        )
-
-        verify(orderFetcher).fetchOrders(eq(site), check { remoteIdsToFetch ->
-            assertThat(remoteIdsToFetch).containsExactlyInAnyOrderElementsOf(
-                    (outdated.summaries + missing.summaries).map { RemoteId(it.remoteOrderId) }
             )
-        })
+
+            verify(orderFetcher).fetchOrders(eq(site), check { remoteIdsToFetch ->
+                assertThat(remoteIdsToFetch).containsExactlyInAnyOrderElementsOf(
+                    (outdated.summaries + missing.summaries).map { it.orderId }
+                )
+            })
+        }
     }
 
     @Test
     fun testUpdateOrderStatusRequestUpdatesLocalDatabase() = runBlocking {
         val orderModel = OrderTestUtils.generateSampleOrder(42, orderStatus = CoreOrderStatus.PROCESSING.value)
-        val site = SiteModel().apply { id = orderModel.localSiteId }
-        OrderSqlUtils.insertOrUpdateOrder(orderModel)
-        val result = RemoteOrderPayload(orderModel.apply { status = CoreOrderStatus.COMPLETED.value }, site)
+                .saveToDb()
+        val site = SiteModel().apply { id = orderModel.localSiteId.value }
+        val result = RemoteOrderPayload(orderModel.copy(status = CoreOrderStatus.COMPLETED.value), site)
         whenever(orderRestClient.updateOrderStatus(orderModel, site, CoreOrderStatus.COMPLETED.value))
                 .thenReturn(result)
 
-        assertThat(OrderSqlUtils.getOrderByLocalId(orderModel.id).status).isEqualTo(CoreOrderStatus.PROCESSING.value)
+        assertThat(ordersDao.getOrder(orderModel.orderId, orderModel.localSiteId)?.status)
+                .isEqualTo(CoreOrderStatus.PROCESSING.value)
 
-        orderStore.updateOrderStatus(LocalId(orderModel.id), site, CoreOrderStatus.COMPLETED.value)
-                .toList()
+        orderStore.updateOrderStatus(
+                orderModel.orderId,
+                site,
+                WCOrderStatusModel(CoreOrderStatus.COMPLETED.value)
+        ).toList()
 
-        assertThat(OrderSqlUtils.getOrderByLocalId(orderModel.id).status).isEqualTo(CoreOrderStatus.COMPLETED.value)
+        assertThat(ordersDao.getOrder(orderModel.orderId, orderModel.localSiteId)?.status)
+                .isEqualTo(CoreOrderStatus.COMPLETED.value)
         Unit
     }
 
     @Test
     fun testRevertLocalOrderUpdateIfRemoteUpdateFails() = runBlocking {
         val orderModel = OrderTestUtils.generateSampleOrder(42, orderStatus = CoreOrderStatus.PROCESSING.value)
-        val site = SiteModel().apply { id = orderModel.localSiteId }
-        OrderSqlUtils.insertOrUpdateOrder(orderModel)
+                .saveToDb()
+        val site = SiteModel().apply { id = orderModel.localSiteId.value }
         whenever(orderRestClient.updateOrderStatus(any(), any(), any())).thenReturn(
-            RemoteOrderPayload(
-                error = OrderError(),
-                order = orderModel,
-                site = site
-            )
+                RemoteOrderPayload(
+                        error = OrderError(),
+                        order = orderModel,
+                        site = site
+                )
         )
 
-        orderStore.updateOrderStatus(LocalId(orderModel.id), site, CoreOrderStatus.COMPLETED.value)
-                .toList()
+        orderStore.updateOrderStatus(
+                orderModel.orderId,
+                site,
+                WCOrderStatusModel(CoreOrderStatus.COMPLETED.value)
+        ).toList()
 
-        assertThat(OrderSqlUtils.getOrderByLocalId(orderModel.id).status).isEqualTo(CoreOrderStatus.PROCESSING.value)
+        assertThat(ordersDao.getOrder(orderModel.orderId, orderModel.localSiteId)?.status)
+                .isEqualTo(CoreOrderStatus.PROCESSING.value)
         Unit
     }
 
-    private fun setupMissingOrders(): MutableMap<WCOrderSummaryModel, WCOrderModel?> {
-        return mutableMapOf<WCOrderSummaryModel, WCOrderModel?>().apply {
+    private fun setupMissingOrders(): MutableMap<WCOrderSummaryModel, OrderEntity?> {
+        return mutableMapOf<WCOrderSummaryModel, OrderEntity?>().apply {
             (21L..30L).forEach { index ->
                 put(
                         OrderTestUtils.generateSampleOrderSummary(
@@ -330,7 +362,7 @@ class WCOrderStoreTest {
     }
 
     private fun setupOutdatedOrders(site: SiteModel) =
-            mutableMapOf<WCOrderSummaryModel, WCOrderModel>().apply {
+            mutableMapOf<WCOrderSummaryModel, OrderEntity>().apply {
                 val baselineDate = "2021-01-05T12:00:00Z"
                 val oneDayAfterBaselineDate = "2021-01-06T12:00:00Z"
                 (11L..20L).forEach { index ->
@@ -342,7 +374,7 @@ class WCOrderStoreTest {
                             ),
                             OrderTestUtils.generateSampleOrder(
                                     siteId = site.id,
-                                    remoteId = index,
+                                    orderId = index,
                                     modified = baselineDate
                             )
                     )
@@ -350,7 +382,7 @@ class WCOrderStoreTest {
             }.toImmutableMap()
 
     private fun setupUpToDateOrders(site: SiteModel) =
-            mutableMapOf<WCOrderSummaryModel, WCOrderModel>().apply {
+            mutableMapOf<WCOrderSummaryModel, OrderEntity>().apply {
                 val baselineDate = "2021-01-05T12:00:00Z"
                 (1L..10L).forEach { index ->
                     put(
@@ -361,16 +393,16 @@ class WCOrderStoreTest {
                             ),
                             OrderTestUtils.generateSampleOrder(
                                     siteId = site.id,
-                                    remoteId = index,
+                                    orderId = index,
                                     modified = baselineDate
                             )
                     )
                 }
             }.toImmutableMap()
 
-    private val Map<WCOrderSummaryModel, WCOrderModel?>.summaries
+    private val Map<WCOrderSummaryModel, OrderEntity?>.summaries
         get() = keys.toList()
 
-    private val Map<WCOrderSummaryModel, WCOrderModel?>.orders
+    private val Map<WCOrderSummaryModel, OrderEntity?>.orders
         get() = values.toList()
 }

@@ -10,6 +10,8 @@ import com.yarolegovich.wellsql.core.annotation.RawConstraints;
 import com.yarolegovich.wellsql.core.annotation.Table;
 
 import org.wordpress.android.fluxc.Payload;
+import org.wordpress.android.fluxc.model.LocalOrRemoteId.LocalId;
+import org.wordpress.android.fluxc.model.LocalOrRemoteId.RemoteId;
 import org.wordpress.android.fluxc.network.BaseRequest.BaseNetworkError;
 import org.wordpress.android.util.AppLog;
 import org.wordpress.android.util.AppLog.T;
@@ -147,6 +149,18 @@ public class SiteModel extends Payload<BaseNetworkError> implements Identifiable
     @Override
     public void setId(int id) {
         mId = id;
+    }
+
+    public LocalId localId() {
+        return new LocalOrRemoteId.LocalId(mId);
+    }
+
+    public RemoteId remoteId() {
+        if (mSiteId != 0L) {
+            return new RemoteId(mSiteId);
+        } else {
+            return new RemoteId(mSelfHostedSiteId);
+        }
     }
 
     public SiteModel() {

@@ -30,7 +30,7 @@ open class WellSqlConfig : DefaultWellConfig {
     annotation class AddOn
 
     override fun getDbVersion(): Int {
-        return 167
+        return 172
     }
 
     override fun getDbName(): String {
@@ -1828,6 +1828,22 @@ open class WellSqlConfig : DefaultWellConfig {
                 }
                 166 -> migrate(version) {
                     db.execSQL("ALTER TABLE SiteModel ADD ACTIVE_JETPACK_CONNECTION_PLUGINS TEXT")
+                }
+                167 -> migrateAddOn(ADDON_WOOCOMMERCE, version) {
+                    db.execSQL("DROP TABLE IF EXISTS WCOrderModel")
+                }
+                168 -> migrateAddOn(ADDON_WOOCOMMERCE, version) {
+                    db.execSQL("ALTER TABLE WCProductModel ADD PURCHASABLE INTEGER")
+                }
+                169 -> migrateAddOn(ADDON_WOOCOMMERCE, version) {
+                    db.execSQL("DROP TABLE IF EXISTS WCPlugins")
+                }
+                170 -> migrateAddOn(ADDON_WOOCOMMERCE, version) {
+                    db.execSQL("DROP TABLE IF EXISTS WCOrderNoteModel")
+                }
+                171 -> migrateAddOn(ADDON_WOOCOMMERCE, version) {
+                    db.execSQL("DELETE FROM WCOrderSummaryModel")
+                    db.execSQL("DELETE FROM WCOrderShipmentTrackingModel")
                 }
             }
         }

@@ -1,7 +1,6 @@
 package org.wordpress.android.fluxc.wc
 
 import android.app.Application
-import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
@@ -10,7 +9,6 @@ import com.nhaarman.mockitokotlin2.mock
 import com.nhaarman.mockitokotlin2.verify
 import com.nhaarman.mockitokotlin2.whenever
 import com.yarolegovich.wellsql.WellSql
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.assertj.core.api.Assertions
 import org.junit.Before
@@ -24,18 +22,18 @@ import org.wordpress.android.fluxc.TestSiteSqlUtils
 import org.wordpress.android.fluxc.UnitTestUtils
 import org.wordpress.android.fluxc.model.SiteModel
 import org.wordpress.android.fluxc.model.WCSSRModel
+import org.wordpress.android.fluxc.model.plugin.SitePluginModel
 import org.wordpress.android.fluxc.network.BaseRequest.GenericErrorType.NETWORK_ERROR
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.WooError
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.WooErrorType.INVALID_RESPONSE
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.WooPayload
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.WooResult
+import org.wordpress.android.fluxc.network.rest.wpcom.wc.system.WCSystemPluginResponse
+import org.wordpress.android.fluxc.network.rest.wpcom.wc.system.WCSystemPluginResponse.SystemPluginModel
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.system.WooSystemRestClient
-import org.wordpress.android.fluxc.network.rest.wpcom.wc.system.WooSystemRestClient.ActivePluginsResponse
-import org.wordpress.android.fluxc.network.rest.wpcom.wc.system.WooSystemRestClient.ActivePluginsResponse.SystemPluginModel
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.system.WooSystemRestClient.SSRResponse
 import org.wordpress.android.fluxc.network.rest.wpcom.wc.system.WooSystemRestClient.WPSiteSettingsResponse
-import org.wordpress.android.fluxc.persistence.WCAndroidDatabase
-import org.wordpress.android.fluxc.persistence.WCPluginSqlUtils.WCPluginModel
+import org.wordpress.android.fluxc.network.rest.wpcom.wc.system.toDomainModel
 import org.wordpress.android.fluxc.persistence.WellSqlConfig
 import org.wordpress.android.fluxc.site.SiteUtils
 import org.wordpress.android.fluxc.store.SiteStore
@@ -56,13 +54,6 @@ class WooCommerceStoreTest {
     private val restClient = mock<WooSystemRestClient>()
     private val siteStore = mock<SiteStore>()
 
-    private val roomDB = Room.inMemoryDatabaseBuilder(
-            appContext,
-            WCAndroidDatabase::class.java
-    )
-            .allowMainThreadQueries()
-            .build()
-
     private val wooCommerceStore = WooCommerceStore(
             appContext = appContext,
             dispatcher = Dispatcher(),
@@ -70,8 +61,7 @@ class WooCommerceStoreTest {
             siteStore = siteStore,
             systemRestClient = restClient,
             wcCoreRestClient = mock(),
-            siteSqlUtils = TestSiteSqlUtils.siteSqlUtils,
-            ssrDao = roomDB.ssrDao()
+            siteSqlUtils = TestSiteSqlUtils.siteSqlUtils
     )
     private val error = WooError(INVALID_RESPONSE, NETWORK_ERROR, "Invalid site ID")
     private val site = SiteModel().apply {
@@ -79,14 +69,24 @@ class WooCommerceStoreTest {
         siteId = TEST_SITE_REMOTE_ID
     }
 
-    private val response = ActivePluginsResponse(
-            listOf(
-                    SystemPluginModel("WooCommerce Shipping &amp; Tax", "1.0"),
-                    SystemPluginModel("Other Plugin", "2.0")
+    private val response = WCSystemPluginResponse(
+        listOf(
+            SystemPluginModel(
+                plugin = "woocommerce-services/woocommerce-services",
+                name = "WooCommerce Shipping &amp; Tax",
+                version = "1.0",
+                url = "url"
             ),
-            listOf(
-                    SystemPluginModel("Inactive", "1.0")
+            SystemPluginModel(
+                plugin = "other-plugin/other-plugin",
+                name = "Other Plugin",
+                version = "2.0",
+                url = "url"
             )
+        ),
+        listOf(
+            SystemPluginModel(plugin = "inactive", name = "Inactive", version = "1.0", url = "url")
+        )
     )
 
     private val sampleJsonObj = stringToJsonObject(
@@ -121,9 +121,9 @@ class WooCommerceStoreTest {
     @Before
     fun setUp() {
         val config = SingleStoreWellSqlConfigForTests(
-                appContext,
-                listOf(WCPluginModel::class.java, SiteModel::class.java),
-                WellSqlConfig.ADDON_WOOCOMMERCE
+            appContext,
+            listOf(SitePluginModel::class.java, SiteModel::class.java),
+            WellSqlConfig.ADDON_WOOCOMMERCE
         )
         WellSql.init(config)
         config.reset()
@@ -174,12 +174,16 @@ class WooCommerceStoreTest {
     fun `when fetching plugin succeeds, then plugins inserted into db`() = test {
         getPlugin(isError = false)
         val expectedModel = response.plugins.mapIndexed { index, model ->
-            WCPluginModel(site, model).apply { id = index + 1 }
+            model.toDomainModel(site.id).apply { id = index + 1 }
         }
 
         val result = wooCommerceStore.getSitePlugins(site)
 
-        Assertions.assertThat(result).isEqualTo(expectedModel)
+        Assertions.assertThat(result)
+            .hasSameSizeAs(expectedModel)
+            .allMatch { model ->
+                expectedModel.any { model.id == it.id && model.name == it.name && model.isActive == it.isActive }
+            }
     }
 
     @Test
@@ -196,17 +200,6 @@ class WooCommerceStoreTest {
 
             Assertions.assertThat(result.isError).isFalse
             Assertions.assertThat(result.model).isNotNull
-        }
-    }
-
-    @Test
-    fun `when fetching ssr succeeds, then data is saved to database`() {
-        runBlocking {
-            whenever(restClient.fetchSSR(any())).thenReturn(WooPayload(ssrResponse))
-            wooCommerceStore.fetchSSR(site)
-
-            val result = wooCommerceStore.observeSSRForSite(TEST_SITE_REMOTE_ID).first()
-            Assertions.assertThat(result).isEqualTo(ssrModel)
         }
     }
 
@@ -232,7 +225,7 @@ class WooCommerceStoreTest {
         }
     }
 
-    private suspend fun getPlugin(isError: Boolean = false): WooResult<List<WCPluginModel>> {
+    private suspend fun getPlugin(isError: Boolean = false): WooResult<List<SitePluginModel>> {
         val payload = WooPayload(response)
         if (isError) {
             whenever(restClient.fetchInstalledPlugins(any())).thenReturn(WooPayload(error))
